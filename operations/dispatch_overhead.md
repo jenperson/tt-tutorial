@@ -39,14 +39,19 @@ This message is essentially the green light: “Everything’s ready — go exec
 Understanding the Fast Dispatch process requires a look at the timeline of events between the dispatcher and the worker cores. This timeline highlights the overlapping and sequential actions that enable efficient kernel execution.
 
 ### Step-by-Step Timeline:
+
 	1.	Worker Executes Kernel
 While a worker core is actively executing a kernel, the dispatcher is already preparing future kernels. This overlapping activity helps maximize system utilization and throughput.
+
 	2.	Kernel Completion
 Once the worker finishes executing a kernel, it sends a “done” signal back to the dispatcher. This marks the official end of the current kernel’s execution.
+
 	3.	“Done” Received → “Go” Sent
 After receiving the “done” message, the dispatcher responds by sending the “go” message for the next kernel. This message gives the worker the green light to begin execution of the next prepared kernel.
+
 	4.	Worker Local Initialization
 During this “done” → “go” handshake, the worker core performs its own local initialization for the next kernel. This setup includes any configuration or pre-execution work needed on the worker side.
+
 	5.	Latency Consideration: Covered vs. Uncovered
 Ideally, the worker’s initialization completes within the handshake window (from “done” to “go”). If it doesn’t, the extra time required becomes uncovered latency — an inefficiency that delays kernel execution.
 	•	Covered latency: Initialization fits within the handshake period → optimal.
