@@ -1,22 +1,16 @@
 # Op Writer's Guide to Dispatch Overhead
 
-This tutorial covers different methods to optimize dispatch overhead resource allocation, kernel initialization, and runtime arguments. There are many tradeoffs between these optimization methods and not one single optimization will benefit all scenarios in the same way. It is up to the developer to determine which optimizations can be best applied to their unique scenario. Finding a balance between these optimization methods requires experimentation.
-
-## Dispatch Time Tradeoffs
-
-When optimizing dispatch time, there is no one-size-fits-all formula. The ideal dispatch strategy depends on your specific workload and performance goals. It’s a balancing act between responsiveness, throughput, and resource contention. Finding the right dispatch timing typically involves some trial and error, with careful attention to system behavior and performance metrics.
+This tutorial covers different methods to optimize dispatch overhead resource allocation, kernel initialization, and runtime arguments. There are many tradeoffs between these optimization methods and no single strategy will benefit all scenarios in the same way. It is up to the developer to determine which optimizations can be best applied to their unique scenario. Finding a balance between these optimization methods requires experimentation.
 
 ## Fast Dispatch Primer
 
-To understand how fast dispatch works, it’s helpful to break down the core communication mechanisms between the dispatch system and worker cores. There are two primary messages involved in this process:
+There are two messages involved in the handshake between the dispatch engine and the workers:
 
 ### 1. Launch Message
 
-The launch message indicates that it is safe to launch a kernel. It prepares the worker core to execute a kernel, but does not initiate execution immediately.
-- **Who sends it?** Sent from the dispatch unit to the worker cores.
-- **When is it sent?** After all kernel data has been transmitted, but before actual execution begins.
-- **Execution relation:** Asynchronous — the launch message is decoupled from kernel execution.
-- **What does it contain?** Kernel metadata such as:
+The launch message contains all the meta data needed to run a kernel. This message is sent to the workers asynchronously (ie, it overlaps the execution of the prior kernel). When the worker receives the launch message it can begin kernel initialization but cannot yet execute the kernel.
+
+The launch message contains kernel metadata such as:
     - Kernel ID (k_id)
     - Number of circular buffers
     - Number of runtime arguments
@@ -53,13 +47,13 @@ After receiving the “done” message, the dispatcher responds by sending the �
 During this “done” → “go” handshake, the worker core performs its own local initialization for the next kernel. This setup includes any configuration or pre-execution work needed on the worker side.
 
 	5.	Latency Consideration: Covered vs. Uncovered
-Ideally, the worker’s initialization completes within the handshake window (from “done” to “go”). If it doesn’t, the extra time required becomes uncovered latency — an inefficiency that delays kernel execution.
+Ideally, the worker’s initialization completes within the handshake window (from “done” to “go”). If it doesn’t, the extra time required becomes "uncovered latency" — an inefficiency that delays kernel execution.
 	•	Covered latency: Initialization fits within the handshake period → optimal.
 	•	Uncovered latency: Initialization exceeds handshake time → suboptimal but potentially fixable through optimization.
 
 ### Timing Insight
 
-In an ideal case, the time between the “done” signal and the “go” message is approximately 700 nanoseconds. This is already fast, but ongoing system improvements aim to reduce this latency even further, unlocking additional performance gains.
+In an ideal case, the time between the “done” signal and the “go” message is approximately 500-600 nanoseconds.
 
 This step-by-step timeline illustrates how the dispatch mechanism is designed for concurrency, but also where inefficiencies can creep in — giving you concrete opportunities for tuning and optimization.
 
@@ -71,7 +65,7 @@ While the fast dispatch mechanism is designed for efficiency, real-world workloa
 
 ![Dispatch/Worker Best Case Diagram](../assets/dispatch-worker-best-case.png)
 
-In the best-case scenario, the dispatcher and worker cores are perfectly synchronized:
+In the best-case scenario, the dispatcher and worker cores complete each step of the handshake without stalling:
 - The worker finishes executing a kernel and sends the “done” message.
 - The dispatcher is already prepared and quickly sends the “go” message for the next kernel.
 - Worker local initialization begins immediately and finishes within the handshake window.
@@ -81,17 +75,13 @@ This is the most efficient path, with minimal latency and high throughput.
 
 ### 2. Dispatcher Behind
 
-This suboptimal scenario can occur when you have multiple short-duration kernels executing in rapid succession.
+This suboptimal scenario can occur either when you have multiple short-duration kernels executing in rapid succession or when the duration of a single kernel dispatch is large enough to exceed the duration of the executing kernels.
 
 ![Dispatch/Worker Dispatcher Behind Diagram](../assets/dispatcher-worker-handshake-behind.png)
 
 **What happens:**
 - The worker finishes a kernel and sends “done”.
 - The dispatcher is still catching up — the launch message for the next kernel is delayed.
-- Because of the delay, worker initialization starts late.
-- As a result, kernel execution is pushed out, increasing end-to-end latency.
-
-This scenario shows how tight workloads with small kernels can expose dispatcher lag.
 
 ### 3. Kernel Size Mismatch: N and N+1 Too Large
 
@@ -131,6 +121,8 @@ On the other hand, compute-bound kernels are generally unaffected by dispatch ov
 
 **Optimization Tip:** To improve execution performance, pay attention to dispatch costs — especially in memory-heavy workloads. DRAM access, memory bandwidth (BW), and dispatch operations all compete for system resources and can create contention bottlenecks.
 
+**Note:** Tenstorrent is actively working on reducing the cost of kernel dispatch by utilizing caches in multiple stages of the dispatch pipeline. Stay tuned!
+
 ## Asynchronous Dispatch
 
 One of the strengths of Tenstorrent’s dispatch model is that it is asynchronous — meaning the dispatch of future kernels overlaps with the execution of current ones.
@@ -140,8 +132,8 @@ One of the strengths of Tenstorrent’s dispatch model is that it is asynchronou
 ### When Asynchronous Dispatch Stalls
 
 Asynchronous dispatch isn’t limitless. It can stall under the following conditions:
-- **Too many kernels ahead:** If m > 6 (i.e., you’re dispatching more than 6 kernels ahead of the one currently executing).
-- **Ring buffer full**: If the kernel ring buffer on the worker is full, the dispatcher must wait before sending more kernels.
+- **Too many kernels ahead:** If m > 6 (i.e., you’re dispatching more than 6 kernels ahead of the one currently executing. This should be very rare).
+- **Ring buffer full**: If the kernel ring buffer on the worker is full, the dispatcher must wait before sending more kernels. This is likely fairly common.
 
 ### Ring Buffer Details:
 - The ring buffer is currently statically set to 70 KB.
@@ -156,7 +148,7 @@ Before a kernel can execute, the firmware performs a set of initialization steps
 1.	**Copy Kernel to IRAM:** On Wormhole platforms, the worker (NCRISC) copies the kernel binary from L1 memory to IRAM.
 2.	**Initialize Circular Buffers (CBs):** Sets up both local and remote CBs required for kernel communication and data movement.
 3.	**Initialize Networks-on-Chip (NoCs):** Prepares the NoC fabric for efficient data routing during kernel execution.
-4.	**Initialize Global Variables:** Sets up static variables and other global state in local memory, ensuring a consistent environment for kernel logic.
+4.	**Initialize Global Variables:** Sets up static variables and other global state in RISC-V local memory, ensuring a consistent environment for kernel logic.
 
 Understanding how dispatch behavior interacts with system resources and how the firmware sets the stage for execution is key to optimizing both dispatch latency and kernel performance.
 
@@ -181,7 +173,7 @@ The copy process runs at approximately 10 bytes per cycle, and the size of the k
 
 ## BRISC vs. NCRISC: Order of Completion for Reader/Writer Kernels
 
-In typical data movement pipelines, the Reader, Compute, and Writer roles are mapped to different kernels. The execution order of these roles influences performance, especially when placed on different cores.
+In typical data movement pipelines there are separate reader, writer and compute kernels. How the reader and writer are mapped to the BRISC and NCRISC processors may impact performance.
 
 ### Common Execution Flow
 
@@ -217,7 +209,7 @@ To avoid this slowdown:
 - Ensure the dispatcher’s ring buffer is sized appropriately and can hold both Kernel N and N+1 together.
 - If this isn’t feasible, reverse the roles:
     - Put the Reader on BRISC.
-	- Put the Writer on NCRISC.
+    - Put the Writer on NCRISC.
 This way, you sidestep the IRAM copy delay for the Reader and ensure better pipeline flow under suboptimal dispatch conditions.
 
 ## Worker Initialization: Circular Buffer (CB) Configurations
@@ -245,23 +237,23 @@ During worker initialization, CB (Circular Buffer) configuration is another sour
 
 ## Number of Kernel Groups
 
-A **kernel group** is a set of cores that receive the same kernel binaries. This concept is crucial for efficient dispatch and minimizing NoC (Network-on-Chip) bandwidth usage.
+A **kernel group** is a set of cores that receive the same kernel binaries. Understanding this concept is crucial for efficient dispatch and minimizing NoC (Network-on-Chip) bandwidth usage.
 
 ### What Defines a Kernel Group?
 - Kernels that share identical binaries (e.g., Data Movement 0, Data Movement 1, Compute) can be dispatched together as a single kernel group.
-- However, any variation in compile-time arguments or defines produces separate binaries, even if sourced from the same codebase — thus creating multiple kernel groups.
+- However, any variation across cores in compile-time arguments or defines produces separate binaries, even if sourced from the same codebase — thus creating multiple kernel groups.
 
 ### Dispatch Implications
 
 - The Dispatcher loops through each kernel group, sending the corresponding binary via multicast.
-- More kernel groups = more dispatch work and higher NoC bandwidth usage.
-- Binary sizes can reach up to 8 KB, and large binary copies cannot be overlapped with prior kernel execution.
+- More kernel groups = more dispatch mcasts resulting higher NoC bandwidth usage.
+- Larger kernel binaries and more kernel groups increase dispatch time potentially preventing overlap with prior kernel execution
 
 ### Optimization Advice
 
 If you're using compile-time arguments to tune behavior, consider this tradeoff:
-- **Pros:** May improve performance for a specific use case.
-- **Cons:** Increases the number of kernel groups, dispatch time, and NoC traffic.
+- **Pros:** May improve kernel execution time.
+- **Cons:** If the compile time arguments vary across cores, it will increase the number of kernel groups and therefore increases dispatch time and NoC traffic.
 
 If the same effect can be achieved with runtime arguments, you’ll reduce kernel group proliferation and improve dispatch performance.
 
@@ -269,7 +261,7 @@ If the same effect can be achieved with runtime arguments, you’ll reduce kerne
 
 The **physical arrangement** of cores in your kernel group also affects how dispatch works — particularly when your groups aren’t rectangular.
 
-### Wormhole: Rectangular MCast Blocks Only
+### Rectangular MCast Blocks Only
 
 On **Wormhole**, multicast operations are limited to rectangular core groups. As a result:
 - Non-rectangular shapes (e.g., L-shaped layouts) must be split into multiple rectangular multicast blocks.
@@ -281,20 +273,15 @@ In the diagram above, what might look like a single logical group becomes:
 - 2 rectangular kernel groups for the L-shaped region (green + purple),
 - 1 group for the isolated orange core — for a total of 3 kernel groups.
 
-### Blackhole: Flexible Multicast
-
-In contrast, Blackhole supports multicast to L-shaped core layouts:
-- The same configuration would only result in 2 kernel groups.
-- This improves dispatch efficiency and reduces kernel group overhead.
-
 ## NoC Flits
 
 The NoC sends data via **Flow Control Units (flits)**.
 - On Wormhole, one flit is 32 bytes.
 - On Blackhole, one flit is 64 bytes.
-- A flit is processed in 1 cycle.
+- The NoC processes a flit in 1 cycle.
 
 ### Bandwidth Calculation Examples:
+(for comparison only. BH clocks are higher than WH)
 - **Wormhole**: `1 GHz * 32 bytes/cycle = 32 GB/s`
 - **Blackhole**: `1 GHz * 64 bytes/cycle = 64 GB/s`
 
@@ -311,9 +298,9 @@ Example diagrams:
 
 ![Cycles per RTA Sent to 8x8 Grid](/assets/dispatch-rta-8-by-8-grid.png) <!-- need to ask for updated diagram -->
 
-- The first runtime argument (RTA) incurs a high cost.
+- The first runtime argument (RTA) incurs a high cost due to RISC-V iterating a unicast across all the cores in the grid.
 - Adding RTAs is bottlenecked by RISC-V and can take many cycles.
-- After about 36 RTAs, cycle cost begins increasing in a stair-step pattern due to flit size alignment.
+- After about 36 RTAs, the RISC-V is no longer the bottleneck and the cost begins increasing in a stair-step pattern due to flit size alignment.
 
 ### Runtime Argument Details:
 - Each RTA is 4 bytes.
@@ -328,11 +315,11 @@ If you're bandwidth-bound and using many RTAs:
 ### Optimization Tip:
 - If multiple cores share the same RTAs, consider multicasting. Multicasting increases dispatch cycles but reduces NoC bandwidth usage.
 - Unique RTAs use fewer dispatch cycles but higher bandwidth.
-- Decide based on your scenario whether unique or common RTAs are optimal.
+- Decide based on your scenario whether unique or common RTAs are optimal.For example, adding a single unique RTA to a set of unique RTAs may very well be "free".
 
 ## RTAs vs Kernel Groups
 
-One common pattern is to use runtime arguments (RTAs) to allow local cores to decide which execution path to follow. This replaces compile-time decisions (which require unique kernel binaries) with dynamic decisions at runtime. For example, if you have a ~2K kernel binary and add an RTA so the same binary can be reused across many cores, and the binary size only increases slightly (e.g., 2K → 2.1K), then that's a great tradeoff. However, if you're using a large monolithic "god kernel" that is already 8K, the benefits of adding RTAs may not outweigh the costs.
+One common pattern is to use runtime arguments (RTAs) to allow cores to decide which execution path to follow. This replaces compile-time decisions (which require unique kernel binaries) with dynamic decisions at runtime. For example, if you have a ~2K kernel binary and add an RTA so the same binary can be reused across many cores, and the binary size only increases slightly (e.g., 2K → 2.1K), then that's a great tradeoff. However, if you generate a large monolithic "god kernel", the cost of dispatching the kernel and making the runtime decisions of what to execute within the kernel may outweigh the cost of using multiple smaller kernels.
 
 ### RTAs
 
@@ -353,7 +340,7 @@ One common pattern is to use runtime arguments (RTAs) to allow local cores to de
 
 ## Global Initialization (Minor Optimization)
 
-It's more efficient to statically initialize global variables rather than initializing them inside the kernel function. This won't cause major savings, but it's a good best practice.
+It's more efficient to statically initialize global variables rather than initializing them inside the kernel function. This won't result in major savings, but it's a good best practice.
 
 ### Bad Example
 
@@ -395,7 +382,7 @@ Why it’s better:
 
 ## T3K (Ethernet Dispatch)
 
-On T3K, dispatch is typically handled by Ethernet cores, in contrast to other platforms where dispatch is performed by Tensix cores. It's important to note that **Ethernet dispatch will never match the performance of Tensix dispatch** due to architectural limitations.
+On T3K, dispatch is typically handled by Ethernet cores, in contrast to other platforms where dispatch is performed by Tensix cores. It's important to note that **Ethernet dispatch performance will never match the performance of Tensix dispatch** due to architectural limitations.
 
 ### Tensix Dispatch
 
